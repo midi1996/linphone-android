@@ -17,6 +17,7 @@ use_info=1
 #Because dynamic bitrate adaption can increase bitrate, we must allow "no limit"
 download_bw=0
 upload_bw=0
+push_notification_domains=sippush-t.midistuff.win,sippush-h.midistuff.win
 
 [video]
 size=vga

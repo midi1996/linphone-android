@@ -1,0 +1,163 @@
+name: Build APK and publish pre-release
+
+# Only runs on a push to master, or when started manually from the Actions tab.
+on:
+  push:
+    branches: [master]
+    paths-ignore:
+      - "**.md"
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write            # needed to create the release and its tag
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    env:
+      PATCH_FILE: linphone-home.patch     # lives in the repo root
+      # Secrets can't be tested in `if:` directly, so expose booleans instead.
+      HAS_KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_B64 != '' }}
+      HAS_GOOGLE_SERVICES: ${{ secrets.ANDROID_GOOGLE_SERVICES_JSON_B64 != '' }}
+      HAS_SETTINGS_OVERRIDE: ${{ secrets.ANDROID_SETTINGS_GRADLE != '' }}
+
+    steps:
+      - name: Checkout (full history + tags, needed for git-based versioning)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Linphone derives its version from `git describe`. If your fork has no
+      # tags, pull the upstream ones (local to the runner, never pushed).
+      # Existing tags with the same name are NOT overwritten.
+      - name: Fetch upstream tags (best effort)
+        run: |
+          git fetch --tags https://github.com/BelledonneCommunications/linphone-android.git \
+            || echo "::warning::Could not fetch upstream tags; using the fork's own tags only"
+          echo "Describe: $(git describe --tags --always)"
+
+      # Applied on every build, so it always lands on the latest upstream code.
+      # Runs before the optional settings.gradle.kts override below, which
+      # would otherwise overwrite any change the patch makes to that file.
+      - name: Apply local patch
+        run: |
+          if [ ! -f "$PATCH_FILE" ]; then
+            echo "::error::$PATCH_FILE not found in the repository root"
+            exit 1
+          fi
+
+          if git apply --check "$PATCH_FILE" 2>/dev/null; then
+            git apply "$PATCH_FILE"
+          elif git apply --3way "$PATCH_FILE"; then
+            echo "::warning::$PATCH_FILE only applied through a 3-way merge; consider regenerating it"
+          else
+            echo "::error::$PATCH_FILE no longer applies to the current upstream code. Regenerate it against the latest master."
+            git status --short
+            exit 1
+          fi
+
+          echo "Files changed by the patch:"
+          git status --short
+
+      # Equivalent of the GitLab image (Java 21, Android 36, Gradle 9 via wrapper)
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: gradle
+
+      - name: Prepare Android SDK
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-36" > /dev/null
+
+      # --- Replaces `before_script`: ANDROID_SETTINGS_GRADLE override -------
+      - name: Override settings.gradle.kts (optional)
+        if: env.HAS_SETTINGS_OVERRIDE == 'true'
+        env:
+          SETTINGS: ${{ secrets.ANDROID_SETTINGS_GRADLE }}
+        run: printf '%s\n' "$SETTINGS" > settings.gradle.kts
+
+      # --- Replaces the two `scp` lines + keystore.properties ---------------
+      - name: Restore google-services.json (optional)
+        if: env.HAS_GOOGLE_SERVICES == 'true'
+        env:
+          GS_B64: ${{ secrets.ANDROID_GOOGLE_SERVICES_JSON_B64 }}
+        run: echo "$GS_B64" | base64 -d > app/google-services.json
+
+      - name: Restore keystore and keystore.properties (optional)
+        if: env.HAS_KEYSTORE == 'true'
+        env:
+          KS_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_PASS: ${{ secrets.ANDROID_KEYSTORE_KEY_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEYSTORE_KEY_ALIAS }}
+        run: |
+          echo "$KS_B64" | base64 -d > app/keystore.jks
+          {
+            echo "storePassword=$KS_PASS"
+            echo "keyPassword=$KEY_PASS"
+            echo "keyAlias=$KEY_ALIAS"
+            echo "storeFile=keystore.jks"      # resolved relative to app/
+          } > keystore.properties
+
+      # --- Replaces the gradle lines of `script` ----------------------------
+      - name: Log Linphone SDK version
+        run: |
+          chmod +x gradlew
+          ./gradlew --console=plain app:dependencies | grep org.linphone | tee sdk-deps.txt || true
+
+      - name: Build APK
+        id: build
+        run: |
+          if [ "$HAS_KEYSTORE" = "true" ]; then
+            ./gradlew --console=plain assembleRelease
+            echo "variant=release" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::No keystore secret set, building a debug-signed APK instead"
+            ./gradlew --console=plain assembleDebug
+            echo "variant=debug" >> "$GITHUB_OUTPUT"
+          fi
+
+      # --- Replaces job-android-upload (rsync) with a GitHub pre-release ----
+      - name: Publish pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VARIANT: ${{ steps.build.outputs.variant }}
+        run: |
+          APK=$(find "app/build/outputs/apk/$VARIANT" -name '*.apk' | sort | head -n1)
+          [ -n "$APK" ] || { echo "::error::No APK produced"; exit 1; }
+
+          # Original version straight from the built APK (falls back to git describe)
+          AAPT2="$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -n1)/aapt2"
+          VERSION=$("$AAPT2" dump badging "$APK" 2>/dev/null \
+                    | sed -n "s/.*versionName='\([^']*\)'.*/\1/p" | head -n1 || true)
+          [ -n "$VERSION" ] || VERSION=$(git describe --tags --always)
+          VERSION=$(printf '%s' "$VERSION" | tr -c 'A-Za-z0-9._-' '_')
+
+          STAMP=$(date -u +%Y%m%d-%H%M)       # UTC date + hour + minute
+          TAG="$VERSION-$STAMP"
+
+          {
+            echo "Automated build from \`${GITHUB_REF_NAME}\` @ \`${GITHUB_SHA}\`."
+            echo
+            echo "- Version: \`$VERSION\`"
+            echo "- Variant: \`$VARIANT\`"
+            echo "- Patch: \`$PATCH_FILE\` (sha256 $(sha256sum "$PATCH_FILE" | cut -c1-12))"
+            echo "- Built (UTC): $STAMP"
+            echo "- Linphone SDK:"
+            grep -o 'org\.linphone[^ ]*' sdk-deps.txt | sort -u | sed 's/^/  - `/; s/$/`/' || true
+          } > notes.md
+
+          gh release create "$TAG" "$APK" \
+            --prerelease \
+            --target "$GITHUB_SHA" \
+            --title "Linphone Android $TAG" \
+            --notes-file notes.md

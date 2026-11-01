@@ -42,7 +42,9 @@ jobs:
             || echo "::warning::Could not fetch upstream tags; using the fork's own tags only"
           echo "Describe: $(git describe --tags --always)"
 
-      # Applied on every build, so it always lands on the latest upstream code.
+      # Makes sure the patch is in the tree on every build: skipped if it is
+      # already committed, re-applied if a merge/reset dropped it, and a hard
+      # failure if it is only partly there or conflicts with upstream.
       # Runs before the optional settings.gradle.kts override below, which
       # would otherwise overwrite any change the patch makes to that file.
       - name: Apply local patch
@@ -52,17 +54,27 @@ jobs:
             exit 1
           fi
 
-          if git apply --check "$PATCH_FILE" 2>/dev/null; then
+          if git apply --reverse --check "$PATCH_FILE" 2>/dev/null; then
+            # Normal case: the patch is already committed in the fork.
+            echo "PATCH_STATE=already applied" >> "$GITHUB_ENV"
+            echo "$PATCH_FILE is already applied, nothing to do."
+          elif git apply --check "$PATCH_FILE" 2>/dev/null; then
+            # The fork lost the changes (e.g. reset to upstream): put them back.
             git apply "$PATCH_FILE"
+            echo "PATCH_STATE=re-applied" >> "$GITHUB_ENV"
+            echo "::notice::$PATCH_FILE was missing from the tree and has been re-applied (not committed)."
           elif git apply --3way "$PATCH_FILE"; then
-            echo "::warning::$PATCH_FILE only applied through a 3-way merge; consider regenerating it"
+            # Upstream changed code near the patch, but Git could still merge it.
+            echo "PATCH_STATE=re-applied via 3-way merge" >> "$GITHUB_ENV"
+            echo "::warning::$PATCH_FILE needed a 3-way merge; consider regenerating it."
           else
-            echo "::error::$PATCH_FILE no longer applies to the current upstream code. Regenerate it against the latest master."
+            # Partly applied, or upstream rewrote the same lines.
+            echo "::error::$PATCH_FILE is neither fully applied nor cleanly applicable (partial merge or conflicting upstream change). Fix the fork or regenerate the patch."
             git status --short
             exit 1
           fi
 
-          echo "Files changed by the patch:"
+          echo "Files changed in the working tree:"
           git status --short
 
       # Equivalent of the GitLab image (Java 21, Android 36, Gradle 9 via wrapper)
@@ -150,7 +162,7 @@ jobs:
             echo
             echo "- Version: \`$VERSION\`"
             echo "- Variant: \`$VARIANT\`"
-            echo "- Patch: \`$PATCH_FILE\` (sha256 $(sha256sum "$PATCH_FILE" | cut -c1-12))"
+            echo "- Patch: \`$PATCH_FILE\`, $PATCH_STATE (sha256 $(sha256sum "$PATCH_FILE" | cut -c1-12))"
             echo "- Built (UTC): $STAMP"
             echo "- Linphone SDK:"
             grep -o 'org\.linphone[^ ]*' sdk-deps.txt | sort -u | sed 's/^/  - `/; s/$/`/' || true

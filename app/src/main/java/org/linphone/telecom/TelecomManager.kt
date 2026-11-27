@@ -25,6 +25,7 @@ import androidx.core.telecom.CallAttributesCompat
 import androidx.core.telecom.CallException
 import androidx.core.telecom.CallsManager
 import android.os.Build
+import androidx.annotation.UiThread
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -36,10 +37,11 @@ import org.linphone.core.CoreListenerStub
 import org.linphone.core.tools.Log
 import org.linphone.utils.LinphoneUtils
 import androidx.core.net.toUri
+import androidx.core.text.isDigitsOnly
 import org.linphone.compatibility.Compatibility
 
 class TelecomManager
-    @WorkerThread
+    @UiThread
     constructor(context: Context) {
     companion object {
         private const val TAG = "[Telecom Manager]"
@@ -96,7 +98,7 @@ class TelecomManager
         Log.i("$TAG Call to [${call.remoteAddress.asStringUriOnly()}] created in state [${call.state}]")
 
         val address = call.callLog.remoteAddress
-        val uri = address.asStringUriOnly().toUri()
+        var uri = address.asStringUriOnly().toUri()
 
         val direction = if (call.dir == Call.Dir.Outgoing) {
             CallAttributesCompat.DIRECTION_OUTGOING
@@ -111,7 +113,26 @@ class TelecomManager
             conferenceInfo?.subject ?: call.conference?.subject ?: LinphoneUtils.getDisplayName(address)
         } else {
             val friend = coreContext.contactsManager.findContactByAddress(address)
-            friend?.name ?: LinphoneUtils.getDisplayName(address)
+            if (friend != null) {
+                // Try to use phone number as tel: URI instead of using full sip: URI
+                // to improve display & contact matching on connected devices such as watches
+                val username = address.username
+                if (!username.isNullOrEmpty() && (username.startsWith("+") || username.isDigitsOnly())) {
+                    Log.i("$TAG Using [tel:$username] URI instead of [$uri] in CallAttributes")
+                    uri = "tel:$username".toUri()
+                } else {
+                    val phoneNumber = LinphoneUtils.getPhoneNumberLinkedToSipAddressByPresence(friend, address)
+                    if (!phoneNumber.isNullOrEmpty()) {
+                        val normalized = LinphoneUtils.getDefaultAccount()?.normalizePhoneNumber(phoneNumber) ?: phoneNumber
+                        Log.i("$TAG Using [tel:$normalized] (from presence) URI instead of [$uri] in CallAttributes")
+                        uri = "tel:$normalized".toUri()
+                    }
+                }
+
+                friend.name.orEmpty().ifEmpty { LinphoneUtils.getDisplayName(address) }
+            } else {
+                LinphoneUtils.getDisplayName(address)
+            }
         }
 
         // Always set type to video (if enabled in Core) as it indicates that video is supported, not that it's being used at the time
